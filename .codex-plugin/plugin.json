@@ -1,0 +1,9 @@
+{
+  "name": "ai-vacation",
+  "version": "0.1.0",
+  "description": "주간 사용 한도를 95% 이상 쓰면 리셋 시각까지 Google 캘린더에 휴가를 표시합니다.",
+  "author": { "name": "HeyonSeo" },
+  "repository": "https://github.com/heyonseo/AI_vacation",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

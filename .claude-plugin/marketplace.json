@@ -1,0 +1,11 @@
+{
+  "name": "ai-vacation",
+  "owner": { "name": "HeyonSeo" },
+  "plugins": [
+    {
+      "name": "ai-vacation",
+      "source": "./",
+      "description": "주간 사용 한도 소진 시 Google 캘린더에 휴가 표시"
+    }
+  ]
+}
