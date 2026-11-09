@@ -1,54 +1,50 @@
 #!/usr/bin/env python3
 """AI Vacation — 주간 한도를 다 쓰면 리셋 시각까지 Google 캘린더에 휴가를 표시한다.
 
-Claude Code와 Codex 양쪽 플러그인 훅에서 같은 스크립트를 호출한다.
-표준 라이브러리만 사용한다(추가 설치 없음).
+캘린더 쓰기는 에이전트가 이미 연결된 Google Calendar MCP로 한다. 이 스크립트는
+사용량을 읽고 "캘린더에 지금 무엇을 해야 하는지"를 판단해 에이전트에게 지시하고,
+에이전트가 처리한 결과(ack)를 기록한다. 표준 라이브러리만 사용한다.
 
 명령:
-  hook                 훅 진입점. stdin을 비우고 백그라운드로 check를 띄운 뒤 즉시 종료.
-  check [--force]      사용량을 읽고 캘린더를 실제 상태에 맞춘다.
-  status               현재 사용량, 휴가 일정, 설정 상태를 보여준다.
-  setup --client-secret FILE   Google OAuth 연결(최초 1회).
+  hook                 Stop 훅 진입점. 할 일이 있으면 에이전트에게 처리 지시(block)를 낸다.
+  plan [--force]       지금 필요한 캘린더 작업을 JSON으로 출력(없으면 null).
+  ack ...              에이전트가 MCP로 처리한 결과를 기록.
+                         --key K --event-id ID --end ISO   생성/수정 완료
+                         --key K --ended                    조기 종료 완료
+                         --key K --dismissed                사용자가 일정을 지워 둠(이번 주 재생성 안 함)
+                         --key K --skip                     캘린더 MCP 없음 등(24시간 보류)
+  status               사용량, 기록된 휴가 일정, 대기 중 작업.
   tap -- CMD...        Claude Code statusLine 래퍼. rate_limits를 캐시하고 원래 CMD로 넘긴다.
   config [KEY VALUE]   설정 보기/변경.
 """
 
-import base64
 import datetime as dt
-import hashlib
 import json
 import os
-import secrets
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 APP_DIR = os.path.expanduser(os.environ.get("AI_VACATION_HOME", "~/.config/ai-vacation"))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-TOKEN_PATH = os.path.join(APP_DIR, "google_token.json")
 STATE_PATH = os.path.join(APP_DIR, "state.json")
 TAP_CACHE_PATH = os.path.join(APP_DIR, "claude_statusline_cache.json")
-LOCK_PATH = os.path.join(APP_DIR, "check.lock")
+LOCK_PATH = os.path.join(APP_DIR, "state.lock")
 LOG_PATH = os.path.join(APP_DIR, "ai-vacation.log")
+SCRIPT = os.path.abspath(__file__)
 
 WEEK_MINUTES = 7 * 24 * 60
-CAL_SCOPE = "https://www.googleapis.com/auth/calendar.events"
-CAL_API = "https://www.googleapis.com/calendar/v3"
 PROVIDER_LABEL = {"claude": "Claude", "codex": "Codex"}
+END_TOLERANCE_S = 120          # 이 정도 차이는 같은 종료 시각으로 본다
+SAME_WINDOW_S = 6 * 3600       # 리셋 시각이 이만큼 흔들려도 같은 주간 창
+REREQUEST_AFTER_S = 30 * 60    # 지시했는데 처리 기록이 없으면 이 뒤에 다시 지시
+SKIP_SNOOZE_S = 24 * 3600
 
 DEFAULT_CONFIG = {
     "threshold_percent": 95,
     "calendar_id": "primary",
-    # "outOfOffice": 캘린더의 '부재중' 일정(Workspace 계정). 실패하면 일반 일정으로 대체.
-    # "default": 일반 '바쁨' 일정.
-    "event_type": "outOfOffice",
-    # outOfOffice일 때 회의 초대 처리: declineNone | declineOnlyNewConversationInvitations | declineAllConflictingInvitations
-    "auto_decline": "declineNone",
     "title": "🏖️ AI 휴가 ({provider} 주간 한도 소진)",
     "providers": ["claude", "codex"],
     "min_check_interval_seconds": 300,
@@ -65,8 +61,12 @@ def iso(t):
     return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_time(v, base=None):
-    """epoch(초/밀리초), ISO 문자열을 aware datetime으로."""
+def local_iso(t):
+    return t.astimezone().isoformat(timespec="seconds")
+
+
+def parse_time(v):
+    """epoch(초/밀리초) 또는 ISO 문자열 → aware datetime."""
     if v is None or v == "":
         return None
     if isinstance(v, (int, float)):
@@ -86,9 +86,7 @@ def parse_time(v, base=None):
             t = dt.datetime.fromisoformat(s)
         except ValueError:
             return None
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=dt.timezone.utc)
-        return t
+        return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
     return None
 
 
@@ -104,13 +102,11 @@ def read_json(path, default=None):
         return default
 
 
-def write_json(path, data, private=False):
+def write_json(path, data):
     ensure_dir()
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    if private:
-        os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
@@ -131,36 +127,21 @@ def load_config():
     return cfg
 
 
-def http_json(method, url, headers=None, body=None, form=None, timeout=10):
-    data = None
-    headers = dict(headers or {})
-    if form is not None:
-        data = urllib.parse.urlencode(form).encode()
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-    elif body is not None:
-        data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-    return json.loads(raw) if raw else {}
-
-
 class Lock:
-    """Claude와 Codex 훅이 동시에 돌아도 일정이 두 번 생기지 않게 한다."""
+    """Claude와 Codex 훅이 동시에 돌아도 같은 지시를 두 번 내지 않게 한다."""
 
-    def __init__(self, path, stale=120):
-        self.path, self.stale, self.ok = path, stale, False
+    def __init__(self, path=None, wait=5.0, stale=60):
+        self.path, self.wait, self.stale, self.ok = path or LOCK_PATH, wait, stale, False
 
     def __enter__(self):
         ensure_dir()
-        for _ in range(2):
+        deadline = time.time() + self.wait
+        while True:
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                os.write(fd, str(os.getpid()).encode())
                 os.close(fd)
                 self.ok = True
-                break
+                return self
             except FileExistsError:
                 try:
                     if time.time() - os.path.getmtime(self.path) > self.stale:
@@ -168,8 +149,9 @@ class Lock:
                         continue
                 except OSError:
                     continue
-                break
-        return self
+                if time.time() > deadline:
+                    return self
+                time.sleep(0.1)
 
     def __exit__(self, *a):
         if self.ok:
@@ -180,7 +162,7 @@ class Lock:
 
 
 # ---------------------------------------------------------------- usage readers
-# 반환 형식: {"provider", "used_percent", "resets_at"(datetime), "source", "observed_at"(datetime)}
+# 반환: {"provider", "used_percent", "resets_at"(datetime), "source", "observed_at"(datetime)}
 
 def _claude_access_token():
     tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
@@ -197,17 +179,12 @@ def _claude_access_token():
             data = json.loads(out.stdout) if out.returncode == 0 else None
         except (OSError, ValueError, subprocess.SubprocessError):
             data = None
-    if not data:
-        return None
-    oauth = data.get("claudeAiOauth") or {}
-    return oauth.get("accessToken")
+    return ((data or {}).get("claudeAiOauth") or {}).get("accessToken")
 
 
 def read_claude_from_tap(max_age=900):
     """statusLine 래퍼(tap)가 남긴 공식 rate_limits 캐시."""
-    c = read_json(TAP_CACHE_PATH)
-    if not c:
-        return None
+    c = read_json(TAP_CACHE_PATH) or {}
     observed = parse_time(c.get("observed_at"))
     sd = (c.get("rate_limits") or {}).get("seven_day") or {}
     if not observed or (now_utc() - observed).total_seconds() > max_age:
@@ -223,12 +200,14 @@ def read_claude_from_api():
     token = _claude_access_token()
     if not token:
         return None
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+        "Authorization": "Bearer " + token,
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "ai-vacation",
+    })
     try:
-        data = http_json("GET", "https://api.anthropic.com/api/oauth/usage", headers={
-            "Authorization": "Bearer " + token,
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "ai-vacation",
-        }, timeout=8)
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read() or b"{}")
     except (urllib.error.URLError, OSError, ValueError) as e:
         log("claude usage api error: %s" % e)
         return None
@@ -257,7 +236,7 @@ def _find_rate_limits(obj):
 
 
 def parse_codex_line(line):
-    """rollout JSONL 한 줄에서 주간(7일) 창을 뽑는다."""
+    """Codex rollout JSONL 한 줄에서 주간(7일) 창을 뽑는다."""
     if "rate_limits" not in line:
         return None
     try:
@@ -268,10 +247,9 @@ def parse_codex_line(line):
     if not rl:
         return None
     observed = parse_time(ev.get("timestamp")) or now_utc()
-    windows = [w for w in (rl.get("secondary"), rl.get("primary")) if isinstance(w, dict)]
     weekly = None
-    for w in windows:
-        if int(w.get("window_minutes") or 0) == WEEK_MINUTES:
+    for w in (rl.get("secondary"), rl.get("primary")):
+        if isinstance(w, dict) and int(w.get("window_minutes") or 0) == WEEK_MINUTES:
             weekly = w
             break
     if weekly is None and isinstance(rl.get("secondary"), dict) and not rl["secondary"].get("window_minutes"):
@@ -319,204 +297,221 @@ def read_codex(max_files=8):
 READERS = {"claude": read_claude, "codex": read_codex}
 
 
-# ---------------------------------------------------------------- Google Calendar
+# ---------------------------------------------------------------- planning (순수 함수)
 
-class Calendar:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.cal = urllib.parse.quote(cfg["calendar_id"], safe="")
-        self._access = None
-
-    @staticmethod
-    def configured():
-        t = read_json(TOKEN_PATH) or {}
-        return bool(t.get("refresh_token") and t.get("client_id"))
-
-    def _token(self):
-        if self._access:
-            return self._access
-        t = read_json(TOKEN_PATH) or {}
-        r = http_json("POST", "https://oauth2.googleapis.com/token", form={
-            "client_id": t["client_id"], "client_secret": t.get("client_secret", ""),
-            "refresh_token": t["refresh_token"], "grant_type": "refresh_token",
-        })
-        self._access = r["access_token"]
-        return self._access
-
-    def _call(self, method, path, body=None, query=None):
-        url = "%s/calendars/%s%s" % (CAL_API, self.cal, path)
-        if query:
-            url += "?" + urllib.parse.urlencode(query)
-        return http_json(method, url, headers={"Authorization": "Bearer " + self._token()}, body=body)
-
-    def find(self, key):
-        r = self._call("GET", "/events", query={
-            "privateExtendedProperty": "aiVacationKey=" + key,
-            "showDeleted": "false", "singleEvents": "true", "maxResults": 5,
-        })
-        items = [e for e in r.get("items", []) if e.get("status") != "cancelled"]
-        return items[0] if items else None
-
-    def get(self, event_id):
-        try:
-            e = self._call("GET", "/events/" + urllib.parse.quote(event_id, safe=""))
-        except urllib.error.HTTPError as err:
-            if err.code in (404, 410):
-                return None
-            raise
-        return None if e.get("status") == "cancelled" else e
-
-    def create(self, reading, key, start):
-        cfg = self.cfg
-        label = PROVIDER_LABEL.get(reading["provider"], reading["provider"])
-        body = {
-            "summary": cfg["title"].format(provider=label),
-            "description": (
-                "%s 주간 사용량이 %.0f%%에 도달했습니다.\n"
-                "한도가 리셋되는 %s까지 휴가로 표시합니다.\n\n"
-                "— AI Vacation 플러그인이 자동으로 만든 일정입니다."
-                % (label, reading["used_percent"], reading["resets_at"].astimezone().strftime("%m/%d %H:%M"))
-            ),
-            "start": {"dateTime": iso(start)},
-            "end": {"dateTime": iso(reading["resets_at"])},
-            "transparency": "opaque",
-            "extendedProperties": {"private": {"aiVacationKey": key, "aiVacationProvider": reading["provider"]}},
-        }
-        if cfg.get("event_type") == "outOfOffice":
-            ooo = dict(body, eventType="outOfOffice", outOfOfficeProperties={
-                "autoDeclineMode": cfg.get("auto_decline", "declineNone"),
-                "declineMessage": "AI 휴가 중입니다. 한도 리셋 후 복귀합니다.",
-            })
-            ooo.pop("description", None)  # 부재중 일정은 설명 필드를 받지 않는다
-            try:
-                return self._call("POST", "/events", body=ooo)
-            except urllib.error.HTTPError as e:
-                # 개인 Gmail 계정 등은 부재중 일정을 만들 수 없다 → 일반 일정으로 대체
-                log("outOfOffice not allowed (%s); falling back to default event" % e.code)
-        return self._call("POST", "/events", body=body)
-
-    def set_end(self, event_id, end):
-        return self._call("PATCH", "/events/" + urllib.parse.quote(event_id, safe=""),
-                          body={"end": {"dateTime": iso(end)}})
+def window_key(reading, pstate=None):
+    """주간 창 식별자. 직전 기록과 리셋 시각이 가까우면 같은 창으로 본다."""
+    prev_end = parse_time((pstate or {}).get("end"))
+    if (pstate or {}).get("key") and prev_end and \
+            abs((prev_end - reading["resets_at"]).total_seconds()) < SAME_WINDOW_S:
+        return pstate["key"]
+    r = reading["resets_at"].astimezone(dt.timezone.utc)
+    return "%s-%s" % (reading["provider"], r.strftime("%Y%m%dT%H"))
 
 
-# ---------------------------------------------------------------- reconcile
-
-def window_key(reading):
-    # 같은 주간 창이면 리셋 시각이 몇 분 흔들려도 같은 키가 되도록 시 단위로 자른다
-    r = reading["resets_at"].astimezone(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
-    return "%s:%s" % (reading["provider"], r.strftime("%Y%m%dT%H"))
-
-
-def reconcile(reading, pstate, cal, cfg, now):
-    """캘린더를 실제 한도 상태에 맞춘다. 갱신된 provider 상태와 수행한 동작을 반환."""
-    pstate = dict(pstate or {})
-    key = window_key(reading)
-    prev_end = parse_time(pstate.get("end"))
-    if pstate.get("key") and prev_end and abs((prev_end - reading["resets_at"]).total_seconds()) < 6 * 3600:
-        key = pstate["key"]  # 리셋 시각이 정각 경계를 넘어 흔들려도 같은 주간 창으로 본다
+def plan(reading, pstate, cfg, now):
+    """지금 캘린더에 필요한 작업 하나(또는 None)."""
+    pstate = pstate or {}
+    key = window_key(reading, pstate)
+    snooze = parse_time(pstate.get("snooze_until"))
+    if snooze and snooze > now and pstate.get("snooze_key") == key:
+        return None
     exhausted = reading["used_percent"] >= float(cfg["threshold_percent"]) and reading["resets_at"] > now
+    same = pstate.get("key") == key
+    base = {"provider": reading["provider"], "key": key,
+            "used_percent": reading["used_percent"], "resets_at": iso(reading["resets_at"])}
 
     if exhausted:
-        ev = None
-        if pstate.get("key") == key and pstate.get("event_id"):
-            ev = cal.get(pstate["event_id"])
-            if ev is None:
-                # 사용자가 일정을 직접 지웠다 → 그 결정을 존중하고 다시 만들지 않는다
-                pstate["dismissed"] = True
-                return pstate, "dismissed"
-        if pstate.get("key") == key and pstate.get("dismissed"):
-            return pstate, "dismissed"
-        if ev is None:
-            ev = cal.find(key)
-        if ev is None:
-            ev = cal.create(reading, key, start=now)
-            action = "created"
-        else:
-            end = parse_time((ev.get("end") or {}).get("dateTime"))
-            if end and abs((end - reading["resets_at"]).total_seconds()) > 120:
-                cal.set_end(ev["id"], reading["resets_at"])
-                action = "extended"
-            else:
-                action = "unchanged"
-        pstate.update(key=key, event_id=ev["id"], end=iso(reading["resets_at"]), dismissed=False)
-        return pstate, action
+        if same and pstate.get("dismissed"):
+            return None
+        if same and pstate.get("event_id"):
+            end = parse_time(pstate.get("end"))
+            if end and abs((end - reading["resets_at"]).total_seconds()) <= END_TOLERANCE_S:
+                return None
+            return dict(base, action="update_end", event_id=pstate["event_id"], end=iso(reading["resets_at"]))
+        return dict(base, action="create", start=iso(now), end=iso(reading["resets_at"]))
 
-    # 한도 미만: 새 주간 창이 열렸는데(조기 리셋 등) 이전 휴가가 남아 있으면 지금으로 끝낸다
+    # 한도 미만: 새 주간 창인데(조기 리셋 등) 이전 휴가가 아직 끝나지 않았으면 지금 끝낸다
     end = parse_time(pstate.get("end"))
-    if pstate.get("event_id") and pstate.get("key") != key and end and end > now:
-        if cal.get(pstate["event_id"]) is not None:
-            cal.set_end(pstate["event_id"], now)
-            return {}, "ended-early"
-        return {}, "cleared"
-    return pstate, "none"
+    if pstate.get("event_id") and not same and end and end > now:
+        return dict(base, action="end_now", key=pstate["key"], event_id=pstate["event_id"], end=iso(now))
+    return None
 
 
-def run_check(force=False, quiet=True):
+def should_request(task, pstate, now):
+    """같은 지시를 반복해서 내지 않는다(다른 도구의 훅 포함)."""
+    p = (pstate or {}).get("pending") or {}
+    at = parse_time(p.get("requested_at"))
+    sig = "%s|%s|%s" % (task["action"], task["key"], task.get("end"))
+    if p.get("sig") == sig and at and (now - at).total_seconds() < REREQUEST_AFTER_S:
+        return False
+    return True
+
+
+def mark_requested(task, pstate, now):
+    pstate = dict(pstate or {})
+    pstate["pending"] = {"sig": "%s|%s|%s" % (task["action"], task["key"], task.get("end")),
+                         "requested_at": iso(now)}
+    return pstate
+
+
+def apply_ack(pstate, key, now, event_id=None, end=None, ended=False, dismissed=False, skip=False):
+    pstate = dict(pstate or {})
+    pstate.pop("pending", None)
+    if skip:
+        pstate.update(snooze_key=key, snooze_until=iso(now + dt.timedelta(seconds=SKIP_SNOOZE_S)))
+    elif dismissed:
+        pstate.update(key=key, dismissed=True)
+        pstate.pop("event_id", None)
+    elif ended:
+        for k in ("key", "event_id", "end", "dismissed"):
+            pstate.pop(k, None)
+    else:
+        pstate.update(key=key, event_id=event_id, end=end, dismissed=False)
+    return pstate
+
+
+# ---------------------------------------------------------------- instructions for the agent
+
+def instruction(task, cfg):
+    label = PROVIDER_LABEL.get(task["provider"], task["provider"])
+    title = cfg["title"].format(provider=label)
+    marker = "[ai-vacation:%s]" % task["key"]
+    ack = 'python3 "%s" ack --key %s' % (SCRIPT, task["key"])
+    reset_local = parse_time(task["resets_at"]).astimezone().strftime("%m/%d %H:%M")
+    head = ("[AI Vacation] %s 주간 사용량 %.0f%% (리셋 %s). 사용자 요청과 별개인 자동 작업이다. "
+            "연결된 Google Calendar MCP 도구로 아래를 처리하고, 끝나면 사용자에게 한 줄로만 알려라.\n"
+            % (label, task["used_percent"], reset_local))
+    no_mcp = ("\nGoogle Calendar MCP 도구가 없으면 일정을 만들지 말고, 사용자에게 'Google Calendar MCP를 연결하면 "
+              "주간 한도 소진 시 휴가가 자동 표시된다'고 한 줄 알린 뒤 `%s --skip` 을 실행하라." % ack)
+    if task["action"] == "create":
+        return head + (
+            "1) 캘린더 `%s`에서 `%s` 문자열이 들어간 일정을 검색한다(중복 방지).\n"
+            "   - 있으면 그 일정의 종료 시각만 %s 로 맞춘다.\n"
+            "   - 없으면 새 일정을 만든다:\n"
+            "     제목: %s\n"
+            "     시작: %s\n"
+            "     종료: %s\n"
+            "     표시: 바쁨(busy). 참석자·알림 추가 금지.\n"
+            "     설명: \"%s 주간 사용량이 %.0f%%에 도달해 리셋 시각까지 휴가로 표시합니다. %s\"\n"
+            "2) 완료 후 실행: `%s --event-id <일정ID> --end %s`"
+            % (cfg["calendar_id"], marker, local_iso(parse_time(task["end"])), title,
+               local_iso(parse_time(task["start"])), local_iso(parse_time(task["end"])),
+               label, task["used_percent"], marker, ack, task["end"])
+        ) + no_mcp
+    if task["action"] == "update_end":
+        return head + (
+            "1) 캘린더 `%s`의 일정 ID `%s`(설명에 `%s`)의 종료 시각을 %s 로 바꾼다.\n"
+            "2) 완료 후 실행: `%s --event-id %s --end %s`\n"
+            "   일정이 없으면(사용자가 지움) 다시 만들지 말고 `%s --dismissed` 실행."
+            % (cfg["calendar_id"], task["event_id"], marker, local_iso(parse_time(task["end"])),
+               ack, task["event_id"], task["end"], ack)
+        ) + no_mcp
+    return head + (
+        "한도가 예정보다 일찍 리셋됐다.\n"
+        "1) 캘린더 `%s`의 일정 ID `%s`(설명에 `%s`)의 종료 시각을 지금(%s)으로 바꿔 휴가를 끝낸다.\n"
+        "2) 완료 후(또는 일정이 이미 없으면) 실행: `%s --ended`"
+        % (cfg["calendar_id"], task["event_id"], marker, local_iso(parse_time(task["end"])), ack)
+    ) + no_mcp
+
+
+# ---------------------------------------------------------------- orchestration
+
+def collect_tasks(force=False, mark=False, now=None):
+    """설정된 도구들의 사용량을 확인하고 필요한 작업 목록을 만든다."""
     cfg = load_config()
-    if not Calendar.configured():
-        if not quiet:
-            print("Google 캘린더가 연결되지 않았습니다. `setup`을 먼저 실행하세요.")
-        return 1
-    with Lock(LOCK_PATH) as lk:
-        if not lk.ok:
-            return 0  # 다른 훅이 이미 처리 중
+    now = now or now_utc()
+    tasks = []
+    with Lock() as lk:
         state = read_json(STATE_PATH, {}) or {}
-        cal = Calendar(cfg)
-        now = now_utc()
         for prov in cfg["providers"]:
             ps = state.get(prov) or {}
             last = parse_time(ps.get("last_check"))
-            if not force and last and (now - last).total_seconds() < cfg["min_check_interval_seconds"]:
-                continue
-            reader = READERS.get(prov)
-            reading = reader() if reader else None
-            ps["last_check"] = iso(now)
-            if reading is None:
-                state[prov] = ps
-                continue
-            ps["last_used_percent"] = reading["used_percent"]
-            ps["last_resets_at"] = iso(reading["resets_at"])
-            ps["last_source"] = reading["source"]
-            try:
-                new_ps, action = reconcile(reading, ps, cal, cfg, now)
-            except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
-                log("%s reconcile error: %s" % (prov, e))
-                state[prov] = ps
-                continue
-            for k in ("last_check", "last_used_percent", "last_resets_at", "last_source"):
-                new_ps[k] = ps[k]
-            state[prov] = new_ps
-            if action not in ("none", "unchanged"):
-                log("%s %.1f%% resets %s -> %s" % (prov, reading["used_percent"], iso(reading["resets_at"]), action))
-            if not quiet:
-                print("%s: %.1f%% (리셋 %s) → %s" % (
-                    PROVIDER_LABEL.get(prov, prov), reading["used_percent"],
-                    reading["resets_at"].astimezone().strftime("%m/%d %H:%M"), action))
-        write_json(STATE_PATH, state)
+            reading = None
+            if force or not last or (now - last).total_seconds() >= cfg["min_check_interval_seconds"]:
+                reader = READERS.get(prov)
+                reading = reader() if reader else None
+                ps["last_check"] = iso(now)
+                if reading:
+                    ps["last_reading"] = {"used_percent": reading["used_percent"],
+                                          "resets_at": iso(reading["resets_at"]), "source": reading["source"]}
+            if reading is None and ps.get("last_reading"):
+                lr = ps["last_reading"]  # 확인 주기 사이에는 직전 값으로 판단
+                reading = {"provider": prov, "used_percent": lr["used_percent"],
+                           "resets_at": parse_time(lr["resets_at"]), "source": lr.get("source")}
+            task = plan(reading, ps, cfg, now) if reading and reading.get("resets_at") else None
+            if task and (not mark or should_request(task, ps, now)):
+                tasks.append(task)
+                if mark:
+                    ps = mark_requested(task, ps, now)
+            state[prov] = ps
+        if lk.ok:
+            write_json(STATE_PATH, state)
+    return tasks, cfg
+
+
+def cmd_hook():
+    raw = ""
+    try:
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+    except OSError:
+        pass
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        payload = {}
+    out = {}
+    # 훅이 만든 이어하기 안에서는 다시 막지 않는다(무한 루프 방지)
+    if not payload.get("stop_hook_active"):
+        try:
+            tasks, cfg = collect_tasks(mark=True)
+        except Exception as e:  # 훅은 어떤 경우에도 작업을 망치지 않는다
+            log("hook error: %r" % e)
+            tasks = []
+        if tasks:
+            out = {"decision": "block", "reason": "\n\n".join(instruction(t, cfg) for t in tasks)}
+            for t in tasks:
+                log("requested %s %s" % (t["action"], t["key"]))
+    sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
     return 0
 
 
-# ---------------------------------------------------------------- commands
+def cmd_plan(args):
+    tasks, cfg = collect_tasks(force="--force" in args)
+    if "--text" in args:
+        print("\n\n".join(instruction(t, cfg) for t in tasks) if tasks else "할 일 없음")
+    else:
+        print(json.dumps(tasks or None, ensure_ascii=False, indent=2))
+    return 0
 
-def cmd_hook():
-    # 훅은 사용자 작업을 절대 막지 않는다: stdin을 비우고 백그라운드로 넘긴 뒤 바로 끝낸다.
-    try:
-        if not sys.stdin.isatty():
-            sys.stdin.read()
-    except OSError:
-        pass
-    if Calendar.configured():
-        kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.name == "nt":
-            kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
-        else:
-            kwargs["start_new_session"] = True
-        try:
-            subprocess.Popen([sys.executable, os.path.abspath(__file__), "check"], **kwargs)
-        except OSError as e:
-            log("hook spawn error: %s" % e)
-    sys.stdout.write("{}\n")
+
+def _opt(args, name):
+    if name in args:
+        i = args.index(name)
+        return args[i + 1] if i + 1 < len(args) else None
+    return None
+
+
+def cmd_ack(args):
+    key = _opt(args, "--key")
+    if not key or "-" not in key:
+        print("--key 가 필요합니다.")
+        return 2
+    prov = key.split("-", 1)[0]
+    event_id, end = _opt(args, "--event-id"), _opt(args, "--end")
+    ended, dismissed, skip = "--ended" in args, "--dismissed" in args, "--skip" in args
+    if not (ended or dismissed or skip) and not (event_id and parse_time(end)):
+        print("--event-id 와 --end 가 필요합니다(또는 --ended / --dismissed / --skip).")
+        return 2
+    with Lock() as lk:
+        state = read_json(STATE_PATH, {}) or {}
+        state[prov] = apply_ack(state.get(prov), key, now_utc(), event_id=event_id,
+                                end=iso(parse_time(end)) if end else None,
+                                ended=ended, dismissed=dismissed, skip=skip)
+        write_json(STATE_PATH, state)
+    log("ack %s %s" % (key, "ended" if ended else "dismissed" if dismissed else "skip" if skip else event_id))
+    print("기록했습니다.")
     return 0
 
 
@@ -536,8 +531,8 @@ def cmd_tap(argv):
 def cmd_status():
     cfg = load_config()
     state = read_json(STATE_PATH, {}) or {}
-    print("Google 캘린더 연결: %s" % ("예" if Calendar.configured() else "아니오 (setup 필요)"))
-    print("휴가 기준: 주간 사용량 %s%% 이상, 캘린더: %s" % (cfg["threshold_percent"], cfg["calendar_id"]))
+    print("휴가 기준: 주간 사용량 %s%% 이상 · 캘린더: %s (Google Calendar MCP로 기록)"
+          % (cfg["threshold_percent"], cfg["calendar_id"]))
     for prov in cfg["providers"]:
         r = READERS[prov]()
         name = PROVIDER_LABEL.get(prov, prov)
@@ -550,8 +545,11 @@ def cmd_status():
                 r["source"], "  ← 휴가 대상" if on else ""))
         ps = state.get(prov) or {}
         if ps.get("event_id"):
-            print("    캘린더 일정: %s (종료 %s)%s" % (ps["event_id"], ps.get("end"),
-                                               " [사용자가 삭제함]" if ps.get("dismissed") else ""))
+            print("    기록된 휴가 일정: %s (종료 %s)" % (ps["event_id"], ps.get("end")))
+        if ps.get("dismissed"):
+            print("    이번 주 휴가 일정은 사용자가 삭제함 → 다시 만들지 않음")
+        if ps.get("pending"):
+            print("    처리 대기: %s" % ps["pending"]["sig"])
     return 0
 
 
@@ -575,87 +573,16 @@ def cmd_config(args):
     return 0
 
 
-def cmd_setup(args):
-    path = None
-    if "--client-secret" in args:
-        i = args.index("--client-secret")
-        path = args[i + 1] if i + 1 < len(args) else None
-    if not path:
-        print(__doc__)
-        print("사용법: ai_vacation.py setup --client-secret ~/Downloads/client_secret_XXX.json")
-        return 2
-    sec = read_json(os.path.expanduser(path)) or {}
-    sec = sec.get("installed") or sec.get("web") or {}
-    if not sec.get("client_id"):
-        print("client secret 파일에서 client_id를 찾지 못했습니다(데스크톱 앱 유형 OAuth 클라이언트 필요).")
-        return 2
-
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    state = secrets.token_urlsafe(16)
-    result = {}
-
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            if q.get("state", [""])[0] == state:
-                result["code"] = q.get("code", [None])[0]
-                result["error"] = q.get("error", [None])[0]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write("<h2>AI Vacation 연결 완료. 이 창을 닫아도 됩니다.</h2>".encode())
-
-        def log_message(self, *a):
-            pass
-
-    srv = HTTPServer(("127.0.0.1", 0), H)
-    redirect = "http://127.0.0.1:%d" % srv.server_port
-    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
-        "client_id": sec["client_id"], "redirect_uri": redirect, "response_type": "code",
-        "scope": CAL_SCOPE, "access_type": "offline", "prompt": "consent",
-        "code_challenge": challenge, "code_challenge_method": "S256", "state": state,
-    })
-    print("브라우저에서 Google 계정을 연결하세요:\n%s\n" % url)
-    try:
-        import webbrowser
-        webbrowser.open(url)
-    except Exception:
-        pass
-    t = threading.Thread(target=lambda: [srv.handle_request() for _ in range(5) if "code" not in result])
-    t.daemon = True
-    t.start()
-    t.join(300)
-    srv.server_close()
-    if not result.get("code"):
-        print("인증이 완료되지 않았습니다: %s" % (result.get("error") or "시간 초과"))
-        return 1
-    tok = http_json("POST", "https://oauth2.googleapis.com/token", form={
-        "client_id": sec["client_id"], "client_secret": sec.get("client_secret", ""),
-        "code": result["code"], "code_verifier": verifier,
-        "grant_type": "authorization_code", "redirect_uri": redirect,
-    })
-    if not tok.get("refresh_token"):
-        print("refresh token을 받지 못했습니다. Google 계정의 앱 권한에서 이 앱을 제거한 뒤 다시 시도하세요.")
-        return 1
-    write_json(TOKEN_PATH, {"client_id": sec["client_id"], "client_secret": sec.get("client_secret", ""),
-                            "refresh_token": tok["refresh_token"], "scope": CAL_SCOPE}, private=True)
-    print("Google 캘린더 연결 완료.\n")
-    cmd_status()
-    return 0
-
-
 def main(argv):
-    cmd = argv[0] if argv else "status"
-    rest = argv[1:]
+    cmd, rest = (argv[0], argv[1:]) if argv else ("status", [])
     if cmd == "hook":
         return cmd_hook()
-    if cmd == "check":
-        return run_check(force="--force" in rest, quiet="--verbose" not in rest and "-v" not in rest)
+    if cmd == "plan":
+        return cmd_plan(rest)
+    if cmd == "ack":
+        return cmd_ack(rest)
     if cmd == "status":
         return cmd_status()
-    if cmd == "setup":
-        return cmd_setup(rest)
     if cmd == "config":
         return cmd_config(rest)
     if cmd == "tap":
